@@ -35,6 +35,7 @@ import java.sql.Timestamp;
 import java.sql.Types;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
 
 import org.opennms.core.utils.DBUtils;
 import org.opennms.netmgt.dao.api.DistPollerDao;
@@ -54,6 +55,10 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.InitializingBean;
 import org.springframework.dao.DataAccessException;
+
+import com.codahale.metrics.MetricRegistry;
+import com.codahale.metrics.Timer;
+import com.codahale.metrics.Timer.Context;
 
 /**
  * EventWriter loads the information in each 'Event' into the database.
@@ -83,6 +88,23 @@ import org.springframework.dao.DataAccessException;
  */
 public final class JdbcEventWriter extends AbstractJdbcPersister implements EventProcessor, InitializingBean {
     private static final Logger LOG = LoggerFactory.getLogger(JdbcEventWriter.class);
+
+    private final Timer writeTimer;
+    private final Timer acquireConnectionTimer;
+    private final Timer getNextIdTimer;
+    private final Timer buildTimer;
+    private final Timer executeTimer;
+    private final Timer commitTimer;
+
+    public JdbcEventWriter(MetricRegistry registry) {
+        writeTimer = Objects.requireNonNull(registry).timer("events.write");
+        acquireConnectionTimer = registry.timer("events.write.acquire");
+        getNextIdTimer = registry.timer("events.write.getnextid");
+        buildTimer = registry.timer("events.write.build");
+        executeTimer = registry.timer("events.write.execute");
+        commitTimer = registry.timer("events.write.commit");
+    }
+
     /**
      * {@inheritDoc}
      *
@@ -94,54 +116,58 @@ public final class JdbcEventWriter extends AbstractJdbcPersister implements Even
             return;
         }
 
-        LOG.debug("JdbcEventWriter: processing {} nodeid: {} ipaddr: {} serviceid: {} time: {}", event.getUei(), event.getNodeid(), event.getInterface(), event.getService(), event.getTime());
-
-        Connection connection;
-        try {
-            connection = getDataSource().getConnection();
-        } catch (final SQLException e) {
-            throw new EventProcessorException(e);
-        }
-
-        try {
-            connection.setAutoCommit(false);
-
-            try {
-                insertEvent(eventHeader, event, connection);
-
-                connection.commit();
+        try (Context context = writeTimer.time()) {
+            LOG.debug("JdbcEventWriter: processing {} nodeid: {} ipaddr: {} serviceid: {} time: {}", event.getUei(), event.getNodeid(), event.getInterface(), event.getService(), event.getTime());
+    
+            Connection connection;
+            try (Context ctx = acquireConnectionTimer.time()) {
+                connection = getDataSource().getConnection();
             } catch (final SQLException e) {
-                LOG.warn("Error inserting event into the datastore.", e);
+                throw new EventProcessorException(e);
+            }
+    
+            try {
+                connection.setAutoCommit(false);
+    
                 try {
-                    connection.rollback();
-                } catch (final Throwable e2) {
-                    LOG.warn("Rollback of transaction failed.", e2);
+                    insertEvent(eventHeader, event, connection);
+    
+                    try (Context ctx = commitTimer.time()) {
+                        connection.commit();
+                    }
+                } catch (final SQLException e) {
+                    LOG.warn("Error inserting event into the datastore.", e);
+                    try {
+                        connection.rollback();
+                    } catch (final Throwable e2) {
+                        LOG.warn("Rollback of transaction failed.", e2);
+                    }
+    
+                    throw e;
+                } catch (final DataAccessException e) {
+                    LOG.warn("Error inserting event into the datastore.", e);
+                    try {
+                        connection.rollback();
+                    } catch (final Throwable e2) {
+                        LOG.warn("Rollback of transaction failed.", e2);
+                    }
+    
+                    throw e;
                 }
-
-                throw e;
             } catch (final DataAccessException e) {
-                LOG.warn("Error inserting event into the datastore.", e);
+                throw new EventProcessorException(e);
+            } catch (SQLException e) {
+                throw new EventProcessorException(e);
+            } finally {
                 try {
-                    connection.rollback();
-                } catch (final Throwable e2) {
-                    LOG.warn("Rollback of transaction failed.", e2);
+                    connection.close();
+                } catch (final SQLException e) {
+                    LOG.warn("SQLException while closing database connection.", e);
                 }
-
-                throw e;
             }
-        } catch (final DataAccessException e) {
-            throw new EventProcessorException(e);
-        } catch (SQLException e) {
-            throw new EventProcessorException(e);
-        } finally {
-            try {
-                connection.close();
-            } catch (final SQLException e) {
-                LOG.warn("SQLException while closing database connection.", e);
-            }
+    
+            LOG.debug("EventWriter finished for : {}", event.getUei());
         }
-
-        LOG.debug("EventWriter finished for : {}", event.getUei());
     }
 
     /**
@@ -156,7 +182,10 @@ public final class JdbcEventWriter extends AbstractJdbcPersister implements Even
      */
     private void insertEvent(final Header eventHeader, final Event event, final Connection connection) throws SQLException {
         // Execute the statement to get the next event id
-        final int eventID = getNextId();
+        int eventID;
+        try (Context ctx = getNextIdTimer.time()) {
+            eventID = getNextId();
+        }
 
         LOG.debug("DBID: {}", eventID);
 
@@ -166,182 +195,187 @@ public final class JdbcEventWriter extends AbstractJdbcPersister implements Even
         final DBUtils d = new DBUtils(getClass());
 
         try {
-            final PreparedStatement insStmt = connection.prepareStatement(EventdConstants.SQL_DB_INS_EVENT);
-            d.watch(insStmt);
+            PreparedStatement insStmt;
+            try (Context ctx = buildTimer.time()) {
+                insStmt = connection.prepareStatement(EventdConstants.SQL_DB_INS_EVENT);
+                d.watch(insStmt);
 
-            // eventID
-            insStmt.setInt(1, eventID);
+                // eventID
+                insStmt.setInt(1, eventID);
 
-            // eventUEI
-            insStmt.setString(2, EventDatabaseConstants.format(event.getUei(), EVENT_UEI_FIELD_SIZE));
+                // eventUEI
+                insStmt.setString(2, EventDatabaseConstants.format(event.getUei(), EVENT_UEI_FIELD_SIZE));
 
-            // nodeID
-            final Long nodeid = event.getNodeid();
-            set(insStmt, 3, event.hasNodeid() ? nodeid.intValue() : -1);
+                // nodeID
+                final Long nodeid = event.getNodeid();
+                set(insStmt, 3, event.hasNodeid() ? nodeid.intValue() : -1);
 
-            // eventTime
-            insStmt.setTimestamp(4, getEventTime(event));
+                // eventTime
+                insStmt.setTimestamp(4, getEventTime(event));
 
-            // Resolve the event host to a hostname using the ipInterface table
-            String hostname = getEventHost(event);
+                // Resolve the event host to a hostname using the ipInterface table
+                String hostname = getEventHost(event);
 
-            // eventHost
-            set(insStmt, 5, EventDatabaseConstants.format(hostname, EVENT_HOST_FIELD_SIZE));
+                // eventHost
+                set(insStmt, 5, EventDatabaseConstants.format(hostname, EVENT_HOST_FIELD_SIZE));
 
-            // ipAddr
-            set(insStmt, 6, EventDatabaseConstants.format(event.getInterface(), EVENT_INTERFACE_FIELD_SIZE));
+                // ipAddr
+                set(insStmt, 6, EventDatabaseConstants.format(event.getInterface(), EVENT_INTERFACE_FIELD_SIZE));
 
-            // systemId
-            String systemId = DistPollerDao.DEFAULT_DIST_POLLER_ID;
-            if (eventHeader != null && eventHeader.getDpName() != null) {
-                systemId = eventHeader.getDpName();
-            } else if (event.getDistPoller() != null) {
-                systemId = event.getDistPoller();
-            }
-            insStmt.setString(7, systemId);
-
-            // eventSnmpHost
-            set(insStmt, 8, EventDatabaseConstants.format(event.getSnmphost(), EVENT_SNMPHOST_FIELD_SIZE));
-
-            // service identifier - convert the service name to a service id
-            set(insStmt, 9, getEventServiceId(event));
-
-            // eventSnmp
-            if (event.getSnmp() != null) {
-                insStmt.setString(10, SnmpInfo.format(event.getSnmp(), EVENT_SNMP_FIELD_SIZE));
-            } else {
-                insStmt.setNull(10, Types.VARCHAR);
-            }
-
-            // eventParms
-
-            // Replace any null bytes with a space, otherwise postgres will complain about encoding in UNICODE 
-            final String parametersString=EventParameterUtils.format(event);
-            set(insStmt, 11, EventDatabaseConstants.format(parametersString, 0));
-
-            // eventCreateTime
-            final Timestamp eventCreateTime = new Timestamp(System.currentTimeMillis());
-            insStmt.setTimestamp(12, eventCreateTime);
-
-            // eventDescr
-            set(insStmt, 13, EventDatabaseConstants.format(event.getDescr(), 0));
-
-            // eventLoggroup
-            set(insStmt, 14, (event.getLoggroupCount() > 0) ? EventDatabaseConstants.format(event.getLoggroup(), EVENT_LOGGRP_FIELD_SIZE) : null);
-
-            // eventLogMsg
-            // eventLog
-            // eventDisplay
-            if (event.getLogmsg() != null) {
-                // set log message
-                set(insStmt, 15, EventDatabaseConstants.format(event.getLogmsg().getContent(), 0));
-                String logdest = event.getLogmsg().getDest();
-                if (logdest.equals("logndisplay")) {
-                    // if 'logndisplay' set both log and display column to yes
-                    set(insStmt, 16, MSG_YES);
-                    set(insStmt, 17, MSG_YES);
-                } else if (logdest.equals("logonly")) {
-                    // if 'logonly' set log column to true
-                    set(insStmt, 16, MSG_YES);
-                    set(insStmt, 17, MSG_NO);
-                } else if (logdest.equals("displayonly")) {
-                    // if 'displayonly' set display column to true
-                    set(insStmt, 16, MSG_NO);
-                    set(insStmt, 17, MSG_YES);
-                } else if (logdest.equals("suppress")) {
-                    // if 'suppress' set both log and display to false
-                    set(insStmt, 16, MSG_NO);
-                    set(insStmt, 17, MSG_NO);
+                // systemId
+                String systemId = DistPollerDao.DEFAULT_DIST_POLLER_ID;
+                if (eventHeader != null && eventHeader.getDpName() != null) {
+                    systemId = eventHeader.getDpName();
+                } else if (event.getDistPoller() != null) {
+                    systemId = event.getDistPoller();
                 }
-            } else {
-                insStmt.setNull(15, Types.VARCHAR);
+                insStmt.setString(7, systemId);
 
-                /*
-                 * If this is an event that had no match in the event conf
-                 * mark it as to be logged and displayed so that there
-                 * are no events that slip through the system
-                 * without the user knowing about them
-                 */
-                set(insStmt, 17, MSG_YES);
-            }
+                // eventSnmpHost
+                set(insStmt, 8, EventDatabaseConstants.format(event.getSnmphost(), EVENT_SNMPHOST_FIELD_SIZE));
 
-            // eventSeverity
-            set(insStmt, 18, OnmsSeverity.get(event.getSeverity()).getId());
+                // service identifier - convert the service name to a service id
+                set(insStmt, 9, getEventServiceId(event));
 
-            // eventPathOutage
-            set(insStmt, 19, (event.getPathoutage() != null) ? EventDatabaseConstants.format(event.getPathoutage(), EVENT_PATHOUTAGE_FIELD_SIZE) : null);
-
-            // eventCorrelation
-            set(insStmt, 20, (event.getCorrelation() != null) ? org.opennms.netmgt.dao.util.Correlation.format(event.getCorrelation(), EVENT_CORRELATION_FIELD_SIZE) : null);
-
-            // eventSuppressedCount
-            insStmt.setNull(21, Types.INTEGER);
-
-            // eventOperInstruct
-            set(insStmt, 22, EventDatabaseConstants.format(event.getOperinstruct(), 0)); // the field should be text on the DB
-
-            // eventAutoAction
-            set(insStmt, 23, (event.getAutoactionCount() > 0) ? AutoAction.format(event.getAutoaction(), EVENT_AUTOACTION_FIELD_SIZE) : null);
-
-            // eventOperAction / eventOperActionMenuText
-            if (event.getOperactionCount() > 0) {
-                final List<Operaction> a = new ArrayList<Operaction>();
-                final List<String> b = new ArrayList<String>();
-
-                for (final Operaction eoa : event.getOperactionCollection()) {
-                    a.add(eoa);
-                    b.add(eoa.getMenutext());
+                // eventSnmp
+                if (event.getSnmp() != null) {
+                    insStmt.setString(10, SnmpInfo.format(event.getSnmp(), EVENT_SNMP_FIELD_SIZE));
+                } else {
+                    insStmt.setNull(10, Types.VARCHAR);
                 }
 
-                set(insStmt, 24, OperatorAction.format(a, EVENT_OPERACTION_FIELD_SIZE));
-                set(insStmt, 25, EventDatabaseConstants.format(b, EVENT_OPERACTION_MENU_FIELD_SIZE));
-            } else {
-                insStmt.setNull(24, Types.VARCHAR);
-                insStmt.setNull(25, Types.VARCHAR);
+                // eventParms
+
+                // Replace any null bytes with a space, otherwise postgres will complain about encoding in UNICODE 
+                final String parametersString=EventParameterUtils.format(event);
+                set(insStmt, 11, EventDatabaseConstants.format(parametersString, 0));
+
+                // eventCreateTime
+                final Timestamp eventCreateTime = new Timestamp(System.currentTimeMillis());
+                insStmt.setTimestamp(12, eventCreateTime);
+
+                // eventDescr
+                set(insStmt, 13, EventDatabaseConstants.format(event.getDescr(), 0));
+
+                // eventLoggroup
+                set(insStmt, 14, (event.getLoggroupCount() > 0) ? EventDatabaseConstants.format(event.getLoggroup(), EVENT_LOGGRP_FIELD_SIZE) : null);
+
+                // eventLogMsg
+                // eventLog
+                // eventDisplay
+                if (event.getLogmsg() != null) {
+                    // set log message
+                    set(insStmt, 15, EventDatabaseConstants.format(event.getLogmsg().getContent(), 0));
+                    String logdest = event.getLogmsg().getDest();
+                    if (logdest.equals("logndisplay")) {
+                        // if 'logndisplay' set both log and display column to yes
+                        set(insStmt, 16, MSG_YES);
+                        set(insStmt, 17, MSG_YES);
+                    } else if (logdest.equals("logonly")) {
+                        // if 'logonly' set log column to true
+                        set(insStmt, 16, MSG_YES);
+                        set(insStmt, 17, MSG_NO);
+                    } else if (logdest.equals("displayonly")) {
+                        // if 'displayonly' set display column to true
+                        set(insStmt, 16, MSG_NO);
+                        set(insStmt, 17, MSG_YES);
+                    } else if (logdest.equals("suppress")) {
+                        // if 'suppress' set both log and display to false
+                        set(insStmt, 16, MSG_NO);
+                        set(insStmt, 17, MSG_NO);
+                    }
+                } else {
+                    insStmt.setNull(15, Types.VARCHAR);
+
+                    /*
+                     * If this is an event that had no match in the event conf
+                     * mark it as to be logged and displayed so that there
+                     * are no events that slip through the system
+                     * without the user knowing about them
+                     */
+                    set(insStmt, 17, MSG_YES);
+                }
+
+                // eventSeverity
+                set(insStmt, 18, OnmsSeverity.get(event.getSeverity()).getId());
+
+                // eventPathOutage
+                set(insStmt, 19, (event.getPathoutage() != null) ? EventDatabaseConstants.format(event.getPathoutage(), EVENT_PATHOUTAGE_FIELD_SIZE) : null);
+
+                // eventCorrelation
+                set(insStmt, 20, (event.getCorrelation() != null) ? org.opennms.netmgt.dao.util.Correlation.format(event.getCorrelation(), EVENT_CORRELATION_FIELD_SIZE) : null);
+
+                // eventSuppressedCount
+                insStmt.setNull(21, Types.INTEGER);
+
+                // eventOperInstruct
+                set(insStmt, 22, EventDatabaseConstants.format(event.getOperinstruct(), 0)); // the field should be text on the DB
+
+                // eventAutoAction
+                set(insStmt, 23, (event.getAutoactionCount() > 0) ? AutoAction.format(event.getAutoaction(), EVENT_AUTOACTION_FIELD_SIZE) : null);
+
+                // eventOperAction / eventOperActionMenuText
+                if (event.getOperactionCount() > 0) {
+                    final List<Operaction> a = new ArrayList<Operaction>();
+                    final List<String> b = new ArrayList<String>();
+
+                    for (final Operaction eoa : event.getOperactionCollection()) {
+                        a.add(eoa);
+                        b.add(eoa.getMenutext());
+                    }
+
+                    set(insStmt, 24, OperatorAction.format(a, EVENT_OPERACTION_FIELD_SIZE));
+                    set(insStmt, 25, EventDatabaseConstants.format(b, EVENT_OPERACTION_MENU_FIELD_SIZE));
+                } else {
+                    insStmt.setNull(24, Types.VARCHAR);
+                    insStmt.setNull(25, Types.VARCHAR);
+                }
+
+                // eventNotification, this column no longer needed
+                insStmt.setNull(26, Types.VARCHAR);
+
+                // eventTroubleTicket / eventTroubleTicket state
+                if (event.getTticket() != null) {
+                    set(insStmt, 27, EventDatabaseConstants.format(event.getTticket().getContent(), EVENT_TTICKET_FIELD_SIZE));
+                    set(insStmt, 28, event.getTticket().getState().equals("on") ? 1 : 0);
+                } else {
+                    insStmt.setNull(27, Types.VARCHAR);
+                    insStmt.setNull(28, Types.INTEGER);
+                }
+
+                // eventForward
+                set(insStmt, 29, (event.getForwardCount() > 0) ? org.opennms.netmgt.dao.util.Forward.format(event.getForward(), EVENT_FORWARD_FIELD_SIZE) : null);
+
+                // eventmouseOverText
+                set(insStmt, 30, EventDatabaseConstants.format(event.getMouseovertext(), EVENT_MOUSEOVERTEXT_FIELD_SIZE));
+
+                // eventAckUser
+                if (event.getAutoacknowledge() != null && event.getAutoacknowledge().getState().equals("on")) {
+                    set(insStmt, 31, EventDatabaseConstants.format(event.getAutoacknowledge().getContent(), EVENT_ACKUSER_FIELD_SIZE));
+
+                    // eventAckTime - if autoacknowledge is present,
+                    // set time to event create time
+                    set(insStmt, 32, eventCreateTime);
+                } else {
+                    insStmt.setNull(31, Types.INTEGER);
+                    insStmt.setNull(32, Types.TIMESTAMP);
+                }
+
+                // eventSource
+                set(insStmt, 33, EventDatabaseConstants.format(event.getSource(), EVENT_SOURCE_FIELD_SIZE));
+
+                // ifindex
+                if (event.hasIfIndex()) {
+                    set(insStmt, 34, event.getIfIndex());
+                } else {
+                    insStmt.setNull(34, Types.INTEGER);
+                }
             }
 
-            // eventNotification, this column no longer needed
-            insStmt.setNull(26, Types.VARCHAR);
-
-            // eventTroubleTicket / eventTroubleTicket state
-            if (event.getTticket() != null) {
-                set(insStmt, 27, EventDatabaseConstants.format(event.getTticket().getContent(), EVENT_TTICKET_FIELD_SIZE));
-                set(insStmt, 28, event.getTticket().getState().equals("on") ? 1 : 0);
-            } else {
-                insStmt.setNull(27, Types.VARCHAR);
-                insStmt.setNull(28, Types.INTEGER);
-            }
-
-            // eventForward
-            set(insStmt, 29, (event.getForwardCount() > 0) ? org.opennms.netmgt.dao.util.Forward.format(event.getForward(), EVENT_FORWARD_FIELD_SIZE) : null);
-
-            // eventmouseOverText
-            set(insStmt, 30, EventDatabaseConstants.format(event.getMouseovertext(), EVENT_MOUSEOVERTEXT_FIELD_SIZE));
-
-            // eventAckUser
-            if (event.getAutoacknowledge() != null && event.getAutoacknowledge().getState().equals("on")) {
-                set(insStmt, 31, EventDatabaseConstants.format(event.getAutoacknowledge().getContent(), EVENT_ACKUSER_FIELD_SIZE));
-
-                // eventAckTime - if autoacknowledge is present,
-                // set time to event create time
-                set(insStmt, 32, eventCreateTime);
-            } else {
-                insStmt.setNull(31, Types.INTEGER);
-                insStmt.setNull(32, Types.TIMESTAMP);
-            }
-
-            // eventSource
-            set(insStmt, 33, EventDatabaseConstants.format(event.getSource(), EVENT_SOURCE_FIELD_SIZE));
-
-            // ifindex
-            if (event.hasIfIndex()) {
-                set(insStmt, 34, event.getIfIndex());
-            } else {
-                insStmt.setNull(34, Types.INTEGER);
-            }
-            
             // execute
-            insStmt.executeUpdate();
+            try (Context ctx = executeTimer.time()) {
+                insStmt.executeUpdate();
+            }
         } finally {
             d.cleanUp();
         }

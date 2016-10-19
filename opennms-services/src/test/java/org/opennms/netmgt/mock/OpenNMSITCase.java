@@ -160,7 +160,7 @@ public class OpenNMSITCase {
             SnmpPeerFactory.setInstance(new SnmpPeerFactory(new ByteArrayResource(getSnmpConfig().getBytes())));
             
             if (isStartEventd()) {
-                m_eventdIpcMgr = new EventIpcManagerDefaultImpl();
+                m_eventdIpcMgr = new EventIpcManagerDefaultImpl(m_registry);
 
                 AbstractEventUtil.setInstance(new EventUtilJdbcImpl());
 
@@ -181,7 +181,7 @@ public class OpenNMSITCase {
                 eventExpander.setEventConfDao(eventConfDao);
                 eventExpander.afterPropertiesSet();
 
-                JdbcEventWriter jdbcEventWriter = new JdbcEventWriter();
+                JdbcEventWriter jdbcEventWriter = new JdbcEventWriter(m_registry);
                 jdbcEventWriter.setEventdServiceManager(eventdServiceManager);
                 jdbcEventWriter.setEventUtil(new EventUtilJdbcImpl());
                 jdbcEventWriter.setDataSource(m_db);

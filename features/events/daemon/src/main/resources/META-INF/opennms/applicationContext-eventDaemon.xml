@@ -47,6 +47,7 @@
   </bean>
 
   <bean id="eventIpcManagerImpl" class="org.opennms.netmgt.eventd.EventIpcManagerDefaultImpl">
+    <constructor-arg ref="eventdMetricRegistry"/>
     <property name="handlerPoolSize" ref="eventIpcManagerHandlerPoolSize"/>
     <property name="handlerQueueLength" ref="eventIpcManagerHandlerQueueLength"/>
     <property name="eventHandler" ref="eventdEventHandler"/>
@@ -92,9 +93,21 @@
     <property name="logEventSummaries" ref="shouldLogEventSummaries" />
   </bean>
 
+  <bean id="eventWriter" class="org.opennms.netmgt.eventd.processor.JdbcEventWriter">
+    <constructor-arg ref="eventdMetricRegistry"/>
+    <property name="getNextIdString" ref="getNextEventIdSql"/>
+    <property name="dataSource" ref="dataSource"/>
+    <property name="eventdServiceManager" ref="eventdServiceManager"/>
+    <property name="eventUtil" ref="eventUtil"/>
+  </bean>
+
+  <bean id="getNextEventIdSql" factory-bean="eventdConfigManager" factory-method="getGetNextEventID"/>
+
+  <!--
   <bean id="eventWriter" class="org.opennms.netmgt.eventd.processor.HibernateEventWriter">
     <constructor-arg ref="eventdMetricRegistry"/>
   </bean>
+  -->
 
   <bean id="eventIpcBroadcastProcessor" class="org.opennms.netmgt.eventd.processor.EventIpcBroadcastProcessor">
     <constructor-arg ref="eventdMetricRegistry"/>

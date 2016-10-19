@@ -45,6 +45,8 @@ import org.opennms.netmgt.xml.event.Log;
 import org.opennms.test.ThrowableAnticipator;
 import org.opennms.test.mock.EasyMockUtils;
 
+import com.codahale.metrics.MetricRegistry;
+
 /**
  * 
  * @author <a href="mailto:dj@opennms.org">DJ Gregor</a>
@@ -59,7 +61,7 @@ public class EventIpcManagerDefaultImplTest extends TestCase {
 
     @Override
     public void setUp() throws Exception {
-        m_manager = new EventIpcManagerDefaultImpl();
+        m_manager = new EventIpcManagerDefaultImpl(new MetricRegistry());
         m_manager.setEventHandler(m_eventHandler);
         m_manager.setHandlerPoolSize(5);
         m_manager.afterPropertiesSet();
@@ -88,7 +90,7 @@ public class EventIpcManagerDefaultImplTest extends TestCase {
         ThrowableAnticipator ta = new ThrowableAnticipator();
         ta.anticipate(new IllegalStateException("handlerPoolSize not set"));
 
-        EventIpcManagerDefaultImpl manager = new EventIpcManagerDefaultImpl();
+        EventIpcManagerDefaultImpl manager = new EventIpcManagerDefaultImpl(new MetricRegistry());
         manager.setEventHandler(m_eventHandler);
         
         try {
@@ -104,7 +106,7 @@ public class EventIpcManagerDefaultImplTest extends TestCase {
         ThrowableAnticipator ta = new ThrowableAnticipator();
         ta.anticipate(new IllegalStateException("eventHandler not set"));
 
-        EventIpcManagerDefaultImpl manager = new EventIpcManagerDefaultImpl();
+        EventIpcManagerDefaultImpl manager = new EventIpcManagerDefaultImpl(new MetricRegistry());
         manager.setHandlerPoolSize(5);
 
         try {
@@ -117,7 +119,7 @@ public class EventIpcManagerDefaultImplTest extends TestCase {
     }
     
     public void testInit() throws Exception {
-        EventIpcManagerDefaultImpl manager = new EventIpcManagerDefaultImpl();
+        EventIpcManagerDefaultImpl manager = new EventIpcManagerDefaultImpl(new MetricRegistry());
         manager.setEventHandler(m_eventHandler);
         manager.setHandlerPoolSize(5);
         manager.afterPropertiesSet();
