@@ -97,12 +97,12 @@ public final class JdbcEventWriter extends AbstractJdbcPersister implements Even
     private final Timer commitTimer;
 
     public JdbcEventWriter(MetricRegistry registry) {
-        writeTimer = Objects.requireNonNull(registry).timer("events.write");
-        acquireConnectionTimer = registry.timer("events.write.acquire");
-        getNextIdTimer = registry.timer("events.write.getnextid");
-        buildTimer = registry.timer("events.write.build");
-        executeTimer = registry.timer("events.write.execute");
-        commitTimer = registry.timer("events.write.commit");
+        writeTimer = Objects.requireNonNull(registry).timer("events.process.write");
+        acquireConnectionTimer = registry.timer("events.process.write.acquire");
+        getNextIdTimer = registry.timer("events.process.write.getnextid");
+        buildTimer = registry.timer("events.process.write.build");
+        executeTimer = registry.timer("events.process.write.execute");
+        commitTimer = registry.timer("events.process.write.commit");
     }
 
     /**

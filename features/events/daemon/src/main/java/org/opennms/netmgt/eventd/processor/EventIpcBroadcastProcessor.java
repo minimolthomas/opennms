@@ -58,7 +58,7 @@ public class EventIpcBroadcastProcessor implements EventProcessor, InitializingB
     private final Timer broadcastTimer;
 
     public EventIpcBroadcastProcessor(MetricRegistry registry) {
-        broadcastTimer = Objects.requireNonNull(registry).timer("events.broadcast");
+        broadcastTimer = Objects.requireNonNull(registry).timer("events.process.broadcast");
     }
 
     /**

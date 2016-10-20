@@ -108,7 +108,7 @@ public class HibernateEventWriter implements EventWriter {
     private final Timer writeTimer;
 
     public HibernateEventWriter(MetricRegistry registry) {
-        writeTimer = Objects.requireNonNull(registry).timer("events.write");
+        writeTimer = Objects.requireNonNull(registry).timer("events.process.write");
     }
 
     /**

@@ -120,7 +120,7 @@ public final class EventExpander implements org.opennms.netmgt.dao.api.EventExpa
     private final Timer expandTimer;
 
     public EventExpander(MetricRegistry registry) {
-        expandTimer = Objects.requireNonNull(registry).timer("events.expand");
+        expandTimer = Objects.requireNonNull(registry).timer("events.process.expand");
     }
 
     /**
